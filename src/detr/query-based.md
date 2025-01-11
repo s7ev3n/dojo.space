@@ -15,6 +15,14 @@ DETR的模型结构很简洁，见图1，DETR模型的重点在decoder部分，�
 
 ### DETR代码细节
 
+DETR整体的代码逻辑可以从下图比较清晰的看出来：
+<div style="text-align: center">
+    <figure style="display: inline-block">
+        <img src="./assets/detr_logic.png" alt="DETR code logic" width="400">
+        <figcaption>Fig. DETR代码结构</figcaption>
+    </figure>
+</div>
+
 在代码的实现中，`query_embed`就是object query，是`DETR`模型的属性，与`transformer`属性并列，它是使用`nn.Embedding`随机初始化的`num_queries x hidden_dim`的向量。
 
 DETR中的`Transformer`并不是标准的transformer，尤其是position encoding部分：标准的transformer中positional encoding是只在第一次输入时候加上去，DETR Decoder中的position encoding有两种，一个是图片中的sine position encoding，在cross attention处加到图片的key中，value没有加，另一个是使用object query (`query_embed`)加到decoder的query上，两种position encoding在每个decoder layer都加，而不是只加在第一次输入上。
@@ -267,7 +275,7 @@ transformerlayers=dict(
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm')),
                     ...
 ```
-主要的工作都发生在`Detr3DCrossAtten`中，它主要包含了`attention_weights`的线性层，q输出前的投影层`output_proj`，以及对参考点的高维映射`position_encoder`(论文里面并没有提及)
+主要的工作都发生在`Detr3DCrossAtten`中，它主要包含了`attention_weights`的线性层，query输出前的投影层`output_proj`，以及对参考点的高维映射`position_encoder`(论文里面并没有提及)
 
 `Detr3DCrossAtten`的`forward`函数
 ```python
@@ -367,9 +375,7 @@ def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
 
 
 ## PETR系列
-PETR系列和DETR系列的对比可以从PETR论文中比较清晰的看到，PETR在三维空间做了3D Position Encoding，并且也在query的生成上做前作进行了改进。
-
-> PETR由于对整个三维空间进行了position encoding，并且也是使用object query对所有的图像特征做global attention，也算是很稠密的计算，并没有发挥sparse query的优势。
+PETRv1在3D Position Encoding上做工作(见下图)：对整个空间进行离散化的位置编码，融合后使图像特征Position Aware，接着object query要和所有的图像特征token交互来更新query。由于对整个三维空间进行了position encoding，并且也是使用object query对所有的图像特征做global attention，是很稠密的计算，并没有发挥sparse query的优势。
 
 <div style="text-align: center">
     <figure style="display: inline-block">
@@ -377,6 +383,8 @@ PETR系列和DETR系列的对比可以从PETR论文中比较清晰的看到，PE
         <figcaption>Fig.3 PETR与DETR和DETR3D的比较</figcaption>
     </figure>
 </div>
+
+PETR时序上的融合需要一个包含历史帧图像特征和3D Position Encoding的队列，这个空间复杂度和时间复杂度都是$O(T)$的，随着历史帧数的增加而显著的增加，因此StreamPETR的改进是使用RNN的方式只需要$t-1$时刻就行。
 
 ### PETRv1
 
@@ -405,3 +413,88 @@ Step 3: 对所有点$p^{3d}$在ROI区域进行归一化，得到$P^{3d}_i \in R^
 ### StreamPETR
 
 ## Sparse4D系列
+Sparse4D系列是和PETR系列同时期的工作，是回归**sparse**本质和anchor这个经典的想法，设计上比PETR更细致、更精巧，重要的是在**时序融合**上performance非常棒，
+
+### Sparse4Dv1
+按照论文的阅读有很多地方感觉写的不太清楚，推荐看作者的讲解视频：[Sparse4D：迈向长时序稀疏化3D目标检测的新实践](https://www.bilibili.com/video/BV13P411q7cm/?spm_id_from=333.337.search-card.all.click&vd_source=39098e1ff8ba531e4e88f9c66b3e7210)
+
+Sparse4D从instance的定义开始，一个instance由三个部分：
+- Anchor: 待检测instance的结构化信息，比如11维度的3D Box`[x, y, z, ln(w), ln(l), ln(h), sin(yaw), cos(yaw), vx, vy, vz]`，论文中初始化900个anchor，位置的初始化先验是从所有的框做了聚类得到的
+- Anchor Embedding: 通过MLP将anchor编码成高维特征，作为position encoding使用，这里在论文中基本没有提及
+- Instance feature: 来自图像的、采样和融合后的特征
+
+<div style="text-align: center">
+    <figure style="display: inline-block">
+        <img src="./assets/sparse4d_d4a.png" alt="Sparse4D Deformable 4D Aggregation" width="500">
+        <figcaption>Fig.5 Sparse4D Deformable 4D</figcaption>
+    </figure>
+</div>
+
+#### 4D keypoints Generation
+
+Step 1. 生成每个Anchor的13个关键点$P_m \in \mathbb{R}^{K \times T \times 3}$，其中$K$是关键点数量，包括$K_F=7$ 固定的关键点和$K_L=6$ 可学习的关键点，可学习的关键点使得模型可以根据需要采样most representative的特征。
+
+Instance feature $F_m$ 和 映射高维的anchor embedding相加后，用来通过一个小模型$\Phi$预测可学习的关键点 $P_{m, t_0}^{K_L}$：
+$$D_m = \mathbf{R}_{yaw} \cdot [\mathbf{sigmoid}(\Phi(F_m))-0.5] \in \mathbb{R^{K_L \times 3}}$$
+$$P^{L}_{m, t_0}=D_m \times [w_m, h_m, l_m] + [x_m, y_m, z_m]$$
+
+$P^{L}_{m, t_0}$的生成方式有点意思，保证learnable keypoints是在原anchor box内部，因为$D_m$是在$[-0.5,0.5]$之间的，即长宽高的一半，乘以$\mathbf{R}_{yaw}$ 使得learnable采样点和框一起旋转。
+
+Step 2. 对anchor(潜在目标物体)进行运动补偿。
+
+利用预测的anchor中的速度，假设速度恒定，从当前时刻$T_0$得到历史时刻3D keypoints在当前时刻坐标系下的坐标：
+$$P'_{m,t}= P_{m, t_0}-d_t\cdot (t_0-t)\cdot[vx_m, vy_m, vz_m]$$
+其中，$d_t$是相邻两帧的时间间隔，$t$和$t_0$只是下标。
+
+Step 3. 对自车进行运动补偿，这个比较简单：
+
+$$P_{m,t}=\mathbf{R}_{t_0\rightarrow t}P'_{m,t}+\mathbf{T}_{t_0 \rightarrow t}$$
+
+#### 根据4D keypoints进行稀疏采样。
+
+得到了4D的时空关键点，开始从图像特征队列中对应的时刻进行双线性差值采样：
+
+$$f_{m,k,t,n,s}=Bilinear(I_{t,n,s} \mathbf{T^{cam}_{n}}P_{t})  \in \mathbf{R}^{K\times T\times N \times S \times C}$$
+
+#### Hierarchy Fusion [重头戏]
+
+$f_{m,k,t,n,s}$融合的顺序：
+1. 不同视角(view)和不同特征尺度(scale)，使用预测的weights
+2. 时序上的融合，使用线性层
+3. 最后是各个关键点的融合，得到的是这个anchor(或者说instance)的特征
+
+##### 视角view和scale维度的融合
+从上一层的instance feature中预测group weights，见Fig.5:
+$$W_m=\Phi(F_m) \in \mathbf{R}^{K\times N\times S\times G}$$
+$G$是对feature channel $C$的分组，类似于group convolution。
+
+接着在view和scale维度相加，$i$表示分组的下标：
+$$f'_{m,k,t,i}=\sum_{n=1}^{N}\sum_{s=1}^{S}W_{m,k,n,s,i}f_{m,k,t,n,s,i}$$
+最后，再重新concat起来，还原feature channel:
+$$f'_{m,k,t}=[f'_{m,k,t,1}, ..., f'_{m,k,t,G}] \in \mathbf{R}^{K\times T \times C}$$
+
+> 你肯定会疑问为什么这么做？论文中没有消融实验来进行进一步说明。
+> 我觉得这里类似DETR3D中论文中没有描述的`attention weights`，是对特征按照channel 打乱的融合，保证每层refine的特征都有变化，当然好像和ShuffleNet中shuffle操作也有神似。
+
+上面的视频中有一个表格，好像是做了这里的消融实验，但是没有在论文中出现：
+<div style="text-align: center">
+    <figure style="display: inline-block">
+        <img src="./assets/sparse4d_fusion_ablation.png" alt="Sparse4D Deformable 4D Aggregation" width="300">
+        <figcaption>Fig.5 Sparse4D Deformable 4D</figcaption>
+    </figure>
+</div>
+
+由此看来如果简单的特征相加，结果非常的差！
+
+##### 时序维度的融合
+使用concat操作和一个小的线性层$\Phi_{temp}$从队列的最后一帧逐渐向当前帧融合:
+$$f''_{m,k}=\Phi_{temp}([f'_{m,k,t_0}, f''_{m,k,t_0-1}])$$
+
+##### 所有关键点融合
+所有关键点的融合就是简单的相加：
+$$F'_{m}=\sum_{k=1}^{K}f''_{m,k}$$
+
+#### Depth Reweight Module
+由于有些关键点再透视投影中可能投到同一个像素位置，导致特征的混乱，这里通过预测的anchor中心点的深度来对每个特征点分配一下权重：
+$$F''_m=Bilinear(\Phi_{depth}(F'_m), \sqrt{x^2_m+y^2_m})$$
+
